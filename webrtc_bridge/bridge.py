@@ -26,6 +26,7 @@ Az RTC_TOPIC kulcsnevek is javítva lettek (`LOWSTATE` -> `LOW_STATE`,
 """
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -33,7 +34,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request
 
 from unitree_webrtc_connect import (
     UnitreeWebRTCConnection,
@@ -44,6 +45,8 @@ from unitree_webrtc_connect import (
     RobotBusyError,
     LocalSignalingPortError,
 )
+from unitree_webrtc_connect.webrtc_audiohub import WebRTCAudioHub, AUDIO_API
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("nero_go2.webrtc_bridge")
@@ -147,6 +150,31 @@ def state():
     )
 
 
+_audio_hub = None
+_loop = None
+
+
+@app.route("/audio/play/<sound_id>", methods=["POST", "GET"])
+def play_audio(sound_id):
+    if _audio_hub is None or _loop is None:
+        return jsonify({"error": "audio hub not ready"}), 503
+    try:
+        # Try playing by audio_id / play_id
+        fut = asyncio.run_coroutine_threadsafe(
+            _audio_hub.data_channel.pub_sub.publish_request_new(
+                "rt/api/audiohub/request",
+                {"api_id": 1002, "parameter": json.dumps({"play_id": str(sound_id)})}
+            ),
+            _loop
+        )
+        res = fut.result(timeout=5)
+        return jsonify({"status": "ok", "played": sound_id, "result": res})
+    except Exception as exc:
+        logger.exception("audio play error")
+        return jsonify({"error": str(exc)}), 500
+
+
+
 def _subscribe(conn, topic, state_key):
     """Subscribe to one data-channel topic; the callback fires (synchronously,
     from the aiortc event loop) whenever a message for that topic arrives.
@@ -204,6 +232,15 @@ async def run_bridge():
 
     _set_state(connected=True)
     logger.info("connected to Go2 at %s", ip)
+
+    global _audio_hub, _loop
+    _loop = asyncio.get_running_loop()
+    try:
+        _audio_hub = WebRTCAudioHub(conn)
+        logger.info("WebRTCAudioHub initialized")
+    except Exception as exc:
+        logger.warning("WebRTCAudioHub init warning: %s", exc)
+
 
     # A robot nem kezdi el ténylegesen küldeni a videó RTP-adatfolyamot,
     # amíg ezt a datachannel-üzenetet nem kapja meg (a "Track received"

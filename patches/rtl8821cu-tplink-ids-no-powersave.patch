@@ -1,0 +1,39 @@
+diff --git a/8821cu.conf b/8821cu.conf
+index 5e3b598..98c597d 100644
+--- a/8821cu.conf
++++ b/8821cu.conf
+@@ -10,7 +10,7 @@
+ blacklist rtw88_8821cu
+ #
+ # Edit the following line to change, add or delete options:
+-options 8821cu rtw_led_ctrl=1
++options 8821cu rtw_power_mgnt=0 rtw_led_ctrl=1
+ #
+ # Note: The above `options` line is a good default for managed mode. Below is
+ # an example for AP mode. Modify as required after reading the documentation:
+diff --git a/Makefile b/Makefile
+index a167695..5ba4a13 100644
+--- a/Makefile
++++ b/Makefile
+@@ -79,7 +79,7 @@ CONFIG_GSPI_HCI = n
+ CONFIG_AP_MODE = y
+ CONFIG_P2P = y
+ CONFIG_MP_INCLUDED = n
+-CONFIG_POWER_SAVING = y
++CONFIG_POWER_SAVING = n
+ CONFIG_IPS_MODE = default
+ CONFIG_LPS_MODE = default
+ CONFIG_USB_AUTOSUSPEND = n
+diff --git a/os_dep/linux/usb_intf.c b/os_dep/linux/usb_intf.c
+index 2cb028c..6acb8ff 100644
+--- a/os_dep/linux/usb_intf.c
++++ b/os_dep/linux/usb_intf.c
+@@ -258,6 +258,8 @@ static struct usb_device_id rtw_usb_id_tbl[] = {
+ #ifdef CONFIG_RTL8821C
+ 	/*=== Realtek demoboard ===*/
+ 	{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDER_ID_REALTEK, 0xb82b, 0xff, 0xff, 0xff), .driver_info = RTL8821C}, /* 8821CU */
++	{USB_DEVICE(0x2357, 0x0138), .driver_info = RTL8821C}, /* TP-Link Archer T2U Nano */
++	{USB_DEVICE(0x2357, 0x0120), .driver_info = RTL8821C}, /* TP-Link Archer T2U Plus */
+ 	{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDER_ID_REALTEK, 0xb820, 0xff, 0xff, 0xff), .driver_info = RTL8821C}, /* 8821CU */
+ 	{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDER_ID_REALTEK, 0xC821, 0xff, 0xff, 0xff), .driver_info = RTL8821C}, /* 8821CU */
+ 	{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDER_ID_REALTEK, 0xC820, 0xff, 0xff, 0xff), .driver_info = RTL8821C}, /* 8821CU */
