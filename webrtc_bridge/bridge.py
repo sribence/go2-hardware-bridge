@@ -48,7 +48,10 @@ from unitree_webrtc_connect import (
 from unitree_webrtc_connect.webrtc_audiohub import WebRTCAudioHub, AUDIO_API
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("unitree_webrtc_connect").setLevel(logging.WARNING)
+logging.getLogger("aiortc").setLevel(logging.WARNING)
+logging.getLogger("aioice").setLevel(logging.WARNING)
 logger = logging.getLogger("nero_go2.webrtc_bridge")
 
 app = Flask(__name__)
@@ -153,25 +156,113 @@ def state():
 _audio_hub = None
 _loop = None
 
+_BUILTIN_AUDIO_MAP = {
+    "obstacle_avoidance": 3001,
+    "obstacle_avoidance_exit": 3002,
+    "companion_mode": 3003,
+    "companion_mode_exit": 3004,
+}
+
 
 @app.route("/audio/play/<sound_id>", methods=["POST", "GET"])
 def play_audio(sound_id):
     if _audio_hub is None or _loop is None:
         return jsonify({"error": "audio hub not ready"}), 503
     try:
-        # Try playing by audio_id / play_id
-        fut = asyncio.run_coroutine_threadsafe(
-            _audio_hub.data_channel.pub_sub.publish_request_new(
-                "rt/api/audiohub/request",
-                {"api_id": 1002, "parameter": json.dumps({"play_id": str(sound_id)})}
-            ),
-            _loop
-        )
+        api_id = _BUILTIN_AUDIO_MAP.get(str(sound_id).lower())
+        if api_id is None and str(sound_id).isdigit():
+            api_id = int(sound_id)
+
+        if api_id:
+            fut = asyncio.run_coroutine_threadsafe(
+                _audio_hub.data_channel.pub_sub.publish_request_new(
+                    "rt/api/audiohub/request",
+                    {"api_id": api_id, "parameter": "{}"}
+                ),
+                _loop
+            )
+        else:
+            fut = asyncio.run_coroutine_threadsafe(
+                _audio_hub.data_channel.pub_sub.publish_request_new(
+                    "rt/api/audiohub/request",
+                    {"api_id": 1002, "parameter": json.dumps({"play_id": str(sound_id)})}
+                ),
+                _loop
+            )
         res = fut.result(timeout=5)
         return jsonify({"status": "ok", "played": sound_id, "result": res})
     except Exception as exc:
         logger.exception("audio play error")
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/audio/megaphone", methods=["POST"])
+def play_megaphone():
+    if _audio_hub is None or _loop is None:
+        return jsonify({"error": "audio hub not ready"}), 503
+
+    if "file" not in request.files:
+        return jsonify({"error": "no file uploaded, expected multipart 'file'"}), 400
+
+    file = request.files["file"]
+    tmp_path = "/tmp/uploaded_speech.wav"
+    file.save(tmp_path)
+
+    async def _stream_megaphone():
+        await _audio_hub.enter_megaphone()
+        await asyncio.sleep(0.3)
+        res = await _audio_hub.upload_megaphone(tmp_path)
+        await asyncio.sleep(0.5)
+        await _audio_hub.exit_megaphone()
+        return res
+
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_stream_megaphone(), _loop)
+        res = fut.result(timeout=30)
+        return jsonify({"status": "ok", "result": res})
+    except Exception as exc:
+        logger.exception("megaphone error")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/speak", methods=["POST"])
+@app.route("/audio/speak", methods=["POST"])
+def speak_text():
+    data = request.json or {}
+    text = data.get("text", "")
+    if not text:
+        return jsonify({"error": "text required"}), 400
+
+    tmp_path = "/tmp/tts_speech.mp3"
+    try:
+        from gtts import gTTS
+        tts = gTTS(text=text, lang="hu")
+        tts.save(tmp_path)
+    except Exception:
+        os.system(f'espeak-ng -w /tmp/tts_speech.wav "{text}" || echo "TTS"')
+        tmp_path = "/tmp/tts_speech.wav"
+
+    async def _stream_tts():
+        if _audio_hub:
+            await _audio_hub.enter_megaphone()
+            await asyncio.sleep(0.3)
+            res = await _audio_hub.upload_megaphone(tmp_path)
+            await asyncio.sleep(0.5)
+            await _audio_hub.exit_megaphone()
+            return res
+        return "audio hub unavailable"
+
+    try:
+        if _audio_hub and _loop:
+            fut = asyncio.run_coroutine_threadsafe(_stream_tts(), _loop)
+            res = fut.result(timeout=30)
+            return jsonify({"status": "ok", "text": text, "result": res})
+        else:
+            return jsonify({"status": "ok", "text": text, "simulated": True})
+    except Exception as exc:
+        logger.exception("tts speak error")
+        return jsonify({"error": str(exc)}), 500
+
 
 
 
@@ -200,76 +291,59 @@ async def _video_callback(track):
 
 
 async def run_bridge():
-    ip = os.environ.get("UNITREE_ROBOT_IP", "192.168.123.18")
-    aes_key = os.environ.get("UNITREE_AES_128_KEY") or None
-
-    conn_kwargs = {"ip": ip}
-    if aes_key:
-        conn_kwargs["aes_128_key"] = aes_key
-
-    conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, **conn_kwargs)
-
-    try:
-        await conn.connect()
-    except AesKeyRequiredError:
-        logger.error(
-            "Robot firmware requires a per-device AES-128 key (firmware >= 1.1.15). "
-            "Fetch it with `unitree-fetch-aes-key` and set UNITREE_AES_128_KEY."
-        )
-        return
-    except AesKeyRejectedError:
-        logger.error("UNITREE_AES_128_KEY was rejected by the robot (wrong key).")
-        return
-    except RobotBusyError:
-        logger.error(
-            "Robot refused the connection - another WebRTC client (e.g. the "
-            "official app) is already connected. Only one client at a time."
-        )
-        return
-    except LocalSignalingPortError:
-        logger.error("Neither port 9991 nor 8081 reachable on %s - check the IP/network.", ip)
-        return
-
-    _set_state(connected=True)
-    logger.info("connected to Go2 at %s", ip)
-
     global _audio_hub, _loop
     _loop = asyncio.get_running_loop()
-    try:
-        _audio_hub = WebRTCAudioHub(conn)
-        logger.info("WebRTCAudioHub initialized")
-    except Exception as exc:
-        logger.warning("WebRTCAudioHub init warning: %s", exc)
 
+    while True:
+        ip = os.environ.get("UNITREE_ROBOT_IP", "192.168.123.161")
+        aes_key = os.environ.get("UNITREE_AES_128_KEY") or None
 
-    # A robot nem kezdi el ténylegesen küldeni a videó RTP-adatfolyamot,
-    # amíg ezt a datachannel-üzenetet nem kapja meg (a "Track received"
-    # log csak a transceiver negociálását jelzi, nem a tényleges adatot) —
-    # ld. a könyvtár hivatalos példája: examples/go2/video/camera_stream/.
-    conn.video.switchVideoChannel(True)
-    conn.video.add_track_callback(_video_callback)
+        conn_kwargs = {"ip": ip}
+        if aes_key:
+            conn_kwargs["aes_128_key"] = aes_key
 
-    # A LiDAR is csak explicit bekapcsolás után kezd adatot küldeni,
-    # ld. a könyvtár hivatalos példája: examples/go2/data_channel/lidar/.
-    # A robot alapból "traffic saving" módban visszatartja a bináris
-    # LiDAR-adatot sávszélesség-spórolás miatt — ezt is ki kell kapcsolni
-    # (ld. webrtc_datachannel.py "#Should turn it on when subscribed to
-    # ulidar topic" megjegyzése a disableTrafficSaving metódus felett).
-    await conn.datachannel.disableTrafficSaving(True)
-    conn.datachannel.pub_sub.publish_without_callback(RTC_TOPIC.get("ULIDAR_SWITCH"), "on")
-    _subscribe(conn, RTC_TOPIC.get("ULIDAR_ARRAY"), "lidar")
-    _subscribe(conn, RTC_TOPIC.get("ULIDAR_STATE"), "lidar_state")
-    _subscribe(conn, RTC_TOPIC.get("LOW_STATE"), "lowstate")
-    _subscribe(conn, RTC_TOPIC.get("SPORT_MOD_STATE"), "sportmodestate")
-    _subscribe(conn, RTC_TOPIC.get("WIRELESS_CONTROLLER"), "wireless_controller")
+        conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, **conn_kwargs)
 
-    try:
-        # Subscriptions + the video callback all run as event-loop callbacks
-        # from here on; just keep the loop alive until the connection drops.
-        while conn.isConnected:
-            await asyncio.sleep(1)
-    finally:
-        _set_state(connected=False)
+        try:
+            await conn.connect()
+        except Exception as e:
+            logger.warning("WebRTC connect attempt error (%s), retrying in 5s...", e)
+            await asyncio.sleep(5)
+            continue
+
+        _set_state(connected=True)
+        logger.info("connected to Go2 at %s", ip)
+
+        try:
+            _audio_hub = WebRTCAudioHub(conn)
+            logger.info("WebRTCAudioHub initialized")
+        except Exception as exc:
+            logger.warning("WebRTCAudioHub init warning: %s", exc)
+
+        try:
+            conn.video.switchVideoChannel(True)
+            conn.video.add_track_callback(_video_callback)
+        except Exception as e:
+            logger.warning("Video channel setup warning: %s", e)
+
+        try:
+            await conn.datachannel.disableTrafficSaving(True)
+            conn.datachannel.pub_sub.publish_without_callback(RTC_TOPIC.get("ULIDAR_SWITCH"), "on")
+            _subscribe(conn, RTC_TOPIC.get("ULIDAR_ARRAY"), "lidar")
+            _subscribe(conn, RTC_TOPIC.get("ULIDAR_STATE"), "lidar_state")
+            _subscribe(conn, RTC_TOPIC.get("LOW_STATE"), "lowstate")
+            _subscribe(conn, RTC_TOPIC.get("SPORT_MOD_STATE"), "sportmodestate")
+            _subscribe(conn, RTC_TOPIC.get("WIRELESS_CONTROLLER"), "wireless_controller")
+        except Exception as e:
+            logger.warning("Datachannel subscriptions warning: %s", e)
+
+        try:
+            while conn.isConnected:
+                await asyncio.sleep(1)
+        finally:
+            _set_state(connected=False)
+            logger.info("WebRTC disconnected, reconnecting in 3s...")
+            await asyncio.sleep(3)
 
 
 def main():
