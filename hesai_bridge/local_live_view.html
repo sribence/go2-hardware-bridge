@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8">
+<title>Hesai LiDAR — élő helyi nézet</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05070a; color: #cde; font-family: monospace; overflow: hidden; }
+  #hud { position: fixed; top: 8px; left: 8px; font-size: 13px; line-height: 1.5; z-index: 2; background: rgba(0,0,0,0.5); padding: 8px 12px; border-radius: 6px; }
+  #hud .ok { color: #4f8; }
+  #hud .bad { color: #f66; }
+  canvas { display: block; }
+  #hint { position: fixed; bottom: 8px; left: 8px; font-size: 12px; color: #789; }
+</style>
+</head>
+<body>
+<div id="hud">
+  Állapot: <span id="status" class="bad">kapcsolódás...</span><br>
+  Csomagok: <span id="packets">0</span><br>
+  Pontok (utolsó frame): <span id="points">0</span><br>
+  Hatótáv: <span id="range">15</span> m (görgetés: zoom)
+</div>
+<div id="hint">Forrás: http://localhost:5003/lidar — 5 Hz polling</div>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let rangeM = 15;
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+window.addEventListener('wheel', (e) => {
+  rangeM *= (e.deltaY > 0) ? 1.1 : 0.9;
+  rangeM = Math.max(1, Math.min(100, rangeM));
+  document.getElementById('range').textContent = rangeM.toFixed(1);
+}, { passive: true });
+
+function worldToScreen(x, y) {
+  const scale = Math.min(canvas.width, canvas.height) / (2 * rangeM);
+  return [
+    canvas.width / 2 + x * scale,
+    canvas.height / 2 - y * scale, // y felfelé = "előre" a szenzor felől
+  ];
+}
+
+function drawGrid() {
+  ctx.strokeStyle = 'rgba(100,140,170,0.15)';
+  ctx.lineWidth = 1;
+  const step = rangeM > 40 ? 10 : (rangeM > 15 ? 5 : 1);
+  for (let m = -Math.ceil(rangeM); m <= Math.ceil(rangeM); m += step) {
+    const [x1, y1] = worldToScreen(m, -rangeM);
+    const [x2, y2] = worldToScreen(m, rangeM);
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    const [x3, y3] = worldToScreen(-rangeM, m);
+    const [x4, y4] = worldToScreen(rangeM, m);
+    ctx.beginPath(); ctx.moveTo(x3, y3); ctx.lineTo(x4, y4); ctx.stroke();
+  }
+  // origó = szenzor
+  const [ox, oy] = worldToScreen(0, 0);
+  ctx.fillStyle = '#4af';
+  ctx.beginPath(); ctx.arc(ox, oy, 5, 0, 2 * Math.PI); ctx.fill();
+  ctx.strokeStyle = '#4af';
+  ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ox, oy - 20); ctx.stroke();
+}
+
+function drawPoints(points) {
+  for (const p of points) {
+    const [x, y, z, intensity] = p;
+    if (Math.abs(x) > rangeM * 1.5 || Math.abs(y) > rangeM * 1.5) continue;
+    const [sx, sy] = worldToScreen(x, y);
+    if (sx < 0 || sx > canvas.width || sy < 0 || sy > canvas.height) continue;
+    const t = Math.max(0, Math.min(1, intensity / 100));
+    // hideg->meleg szín intenzitás szerint (kék -> zöld -> narancs)
+    const r = Math.round(60 + t * 195);
+    const g = Math.round(140 + t * 60);
+    const b = Math.round(220 - t * 180);
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(sx, sy, 2, 2);
+  }
+}
+
+let lastPacketCount = 0;
+async function tick() {
+  ctx.fillStyle = '#05070a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  drawGrid();
+
+  try {
+    const [healthRes, lidarRes] = await Promise.all([
+      fetch('http://localhost:5003/health').then(r => r.json()),
+      fetch('http://localhost:5003/lidar').then(r => r.ok ? r.json() : []),
+    ]);
+    document.getElementById('packets').textContent = healthRes.packet_count;
+    const statusEl = document.getElementById('status');
+    if (healthRes.connected) {
+      statusEl.textContent = 'ÉLŐ';
+      statusEl.className = 'ok';
+    } else {
+      statusEl.textContent = 'nincs adat (várakozás csomagokra)';
+      statusEl.className = 'bad';
+    }
+    if (Array.isArray(lidarRes)) {
+      document.getElementById('points').textContent = lidarRes.length;
+      drawPoints(lidarRes);
+    }
+  } catch (e) {
+    document.getElementById('status').textContent = 'híd offline (localhost:5003)';
+    document.getElementById('status').className = 'bad';
+  }
+}
+
+setInterval(tick, 200);
+tick();
+</script>
+</body>
+</html>
