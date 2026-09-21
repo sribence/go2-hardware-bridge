@@ -73,7 +73,7 @@ XT16_ELEV_COS = [math.cos(a) for a in XT16_ELEV_RAD]
 _state_lock = threading.Lock()
 _state = {
     "connected": False,
-    "latest_points": None,  # list of [x, y, z, intensity]
+    "latest_points": None,  # list of [x, y, z, intensity, azimuth_deg]
     "packet_count": 0,
     "last_packet_time": None,
     "spin_speed": None,
@@ -135,7 +135,9 @@ def _parse_packet(buf):
             x = xy_dist * sin_az
             y = xy_dist * cos_az
             z = distance_m * sin_el
-            points.append([round(x, 3), round(y, 3), round(z, 3), intensity])
+            # azimuth (fok, 0-360) megtartva mint 5. mező - a sweepen belüli
+            # relatív időpont deskewhez kell (lásd deskew terv, MEMORY.md).
+            points.append([round(x, 3), round(y, 3), round(z, 3), intensity, round(azimuth_raw / 100.0, 2)])
 
     return points
 
