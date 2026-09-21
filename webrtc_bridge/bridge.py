@@ -56,6 +56,14 @@ logger = logging.getLogger("nero_go2.webrtc_bridge")
 
 app = Flask(__name__)
 
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
 # --- shared state, one lock guards all of it (simpler than per-key locks,
 # and none of these updates are hot enough to need finer granularity) ---
 _state_lock = threading.Lock()
@@ -164,8 +172,10 @@ _BUILTIN_AUDIO_MAP = {
 }
 
 
-@app.route("/audio/play/<sound_id>", methods=["POST", "GET"])
+@app.route("/audio/play/<sound_id>", methods=["POST", "GET", "OPTIONS"])
 def play_audio(sound_id):
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
     if _audio_hub is None or _loop is None:
         return jsonify({"error": "audio hub not ready"}), 503
     try:
@@ -196,8 +206,10 @@ def play_audio(sound_id):
         return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/audio/megaphone", methods=["POST"])
+@app.route("/audio/megaphone", methods=["POST", "OPTIONS"])
 def play_megaphone():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
     if _audio_hub is None or _loop is None:
         return jsonify({"error": "audio hub not ready"}), 503
 
@@ -225,9 +237,11 @@ def play_megaphone():
         return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/api/speak", methods=["POST"])
-@app.route("/audio/speak", methods=["POST"])
+@app.route("/api/speak", methods=["POST", "OPTIONS"])
+@app.route("/audio/speak", methods=["POST", "OPTIONS"])
 def speak_text():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
     data = request.json or {}
     text = data.get("text", "")
     if not text:
@@ -352,7 +366,14 @@ def main():
         daemon=True,
     )
     flask_thread.start()
-    asyncio.run(run_bridge())
+    
+    while True:
+        try:
+            asyncio.run(run_bridge())
+        except Exception as e:
+            logger.error("run_bridge exception: %s, restarting in 5s...", e)
+            import time
+            time.sleep(5)
 
 
 if __name__ == "__main__":
