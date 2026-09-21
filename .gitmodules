@@ -1,0 +1,3 @@
+[submodule "rtl8821cu_driver"]
+	path = rtl8821cu_driver
+	url = https://github.com/morrownr/8821cu-20210916.git
