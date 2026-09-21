@@ -73,7 +73,7 @@ XT16_ELEV_COS = [math.cos(a) for a in XT16_ELEV_RAD]
 _state_lock = threading.Lock()
 _state = {
     "connected": False,
-    "latest_points": None,  # list of [x, y, z, intensity, azimuth_deg]
+    "latest_points": None,  # list of [x, y, z, intensity, azimuth_deg, recv_time]
     "packet_count": 0,
     "last_packet_time": None,
     "spin_speed": None,
@@ -90,9 +90,15 @@ def _get_state():
         return dict(_state)
 
 
-def _parse_packet(buf):
+def _parse_packet(buf, recv_time=None):
     """Egyetlen 568 bájtos PandarXT-16 UDP csomagot dekódol pontlistává.
-    Visszaad None-t, ha a csomag nem PandarXT-16 formátumú."""
+    Visszaad None-t, ha a csomag nem PandarXT-16 formátumú.
+
+    recv_time: a csomag vételi ideje (time.time()). Az azimuth önmagában
+    NEM elég a sweepen belüli időrend visszaállításához, mert egy 0.2s-os
+    frame_buffer több teljes 360°-os körbefordulást is tartalmazhat a
+    spin sebességtől függően - ezért a tényleges vételi időbélyeg is kell
+    a deskewhez (lásd deskew terv, MEMORY.md project_go2_lidar_deskew_plan)."""
     if len(buf) < HEADER_SIZE + 2:
         return None
 
@@ -135,9 +141,10 @@ def _parse_packet(buf):
             x = xy_dist * sin_az
             y = xy_dist * cos_az
             z = distance_m * sin_el
-            # azimuth (fok, 0-360) megtartva mint 5. mező - a sweepen belüli
-            # relatív időpont deskewhez kell (lásd deskew terv, MEMORY.md).
-            points.append([round(x, 3), round(y, 3), round(z, 3), intensity, round(azimuth_raw / 100.0, 2)])
+            # azimuth (fok) + vételi időbélyeg megtartva mint 5-6. mező -
+            # együtt kell a sweepen belüli deskewhez.
+            points.append([round(x, 3), round(y, 3), round(z, 3), intensity,
+                            round(azimuth_raw / 100.0, 2), recv_time])
 
     return points
 
@@ -162,7 +169,7 @@ def _udp_listener():
             logger.exception("UDP recv error")
             continue
 
-        points = _parse_packet(data)
+        points = _parse_packet(data, recv_time=time.time())
         if points is None:
             continue
 
