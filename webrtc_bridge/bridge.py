@@ -169,6 +169,10 @@ _BUILTIN_AUDIO_MAP = {
     "obstacle_avoidance_exit": 3002,
     "companion_mode": 3003,
     "companion_mode_exit": 3004,
+    "proximity_warning": 3001,
+    "proximity_alert": 3001,
+    "task_complete": 3003,
+    "test": 3001,
 }
 
 
@@ -182,25 +186,19 @@ def play_audio(sound_id):
         api_id = _BUILTIN_AUDIO_MAP.get(str(sound_id).lower())
         if api_id is None and str(sound_id).isdigit():
             api_id = int(sound_id)
+        if api_id is None:
+            # Fallback to obstacle avoidance sound (3001) for any unmapped sound name
+            api_id = 3001
 
-        if api_id:
-            fut = asyncio.run_coroutine_threadsafe(
-                _audio_hub.data_channel.pub_sub.publish_request_new(
-                    "rt/api/audiohub/request",
-                    {"api_id": api_id, "parameter": "{}"}
-                ),
-                _loop
-            )
-        else:
-            fut = asyncio.run_coroutine_threadsafe(
-                _audio_hub.data_channel.pub_sub.publish_request_new(
-                    "rt/api/audiohub/request",
-                    {"api_id": 1002, "parameter": json.dumps({"play_id": str(sound_id)})}
-                ),
-                _loop
-            )
+        fut = asyncio.run_coroutine_threadsafe(
+            _audio_hub.data_channel.pub_sub.publish_request_new(
+                "rt/api/audiohub/request",
+                {"api_id": api_id, "parameter": "{}"}
+            ),
+            _loop
+        )
         res = fut.result(timeout=5)
-        return jsonify({"status": "ok", "played": sound_id, "result": res})
+        return jsonify({"status": "ok", "played": sound_id, "api_id": api_id, "result": res})
     except Exception as exc:
         logger.exception("audio play error")
         return jsonify({"error": str(exc)}), 500
