@@ -278,12 +278,21 @@ def speak_text():
 
 
 
+import time
+
+_last_rx_time = 0.0
+
+def _touch_rx():
+    global _last_rx_time
+    _last_rx_time = time.time()
+
 def _subscribe(conn, topic, state_key):
     """Subscribe to one data-channel topic; the callback fires (synchronously,
     from the aiortc event loop) whenever a message for that topic arrives.
     `pub_sub.subscribe()` itself is a plain synchronous call, not async."""
 
     def _on_message(message):
+        _touch_rx()
         _set_state(**{state_key: message.get("data", message)})
 
     conn.datachannel.pub_sub.subscribe(topic, _on_message)
@@ -294,16 +303,20 @@ async def _video_callback(track):
     consumes+discards the very first frame before calling this, and awaits
     us directly from its pc.on("track") handler, so this just loops for
     the life of the track."""
-    while True:
-        frame = await track.recv()
-        img = frame.to_ndarray(format="bgr24")
-        ok, jpeg = cv2.imencode(".jpg", img)
-        if ok:
-            _set_state(latest_jpeg=jpeg.tobytes())
+    try:
+        while True:
+            frame = await track.recv()
+            img = frame.to_ndarray(format="bgr24")
+            ok, jpeg = cv2.imencode(".jpg", img)
+            if ok:
+                _touch_rx()
+                _set_state(latest_jpeg=jpeg.tobytes())
+    except Exception as e:
+        logger.warning("_video_callback exception: %s", e)
 
 
 async def run_bridge():
-    global _audio_hub, _loop
+    global _audio_hub, _loop, _last_rx_time
     _loop = asyncio.get_running_loop()
 
     while True:
@@ -324,6 +337,7 @@ async def run_bridge():
             continue
 
         _set_state(connected=True)
+        _last_rx_time = time.time()
         logger.info("connected to Go2 at %s", ip)
 
         try:
@@ -352,8 +366,15 @@ async def run_bridge():
         try:
             while conn.isConnected:
                 await asyncio.sleep(1)
+                if time.time() - _last_rx_time > 6.0:
+                    logger.warning("No WebRTC data/video received for >6s (connection stale). Reconnecting...")
+                    break
         finally:
-            _set_state(connected=False)
+            _set_state(connected=False, latest_jpeg=None)
+            try:
+                await conn.disconnect()
+            except Exception:
+                pass
             logger.info("WebRTC disconnected, reconnecting in 3s...")
             await asyncio.sleep(3)
 
