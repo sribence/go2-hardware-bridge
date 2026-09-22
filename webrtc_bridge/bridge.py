@@ -321,7 +321,7 @@ async def run_bridge():
 
     while True:
         ip = os.environ.get("UNITREE_ROBOT_IP", "192.168.123.161")
-        aes_key = os.environ.get("UNITREE_AES_128_KEY") or None
+        aes_key = os.environ.get("UNITREE_AES_128_KEY") or "7c5a74e640766444cc26b19990968133"
 
         conn_kwargs = {"ip": ip}
         if aes_key:
