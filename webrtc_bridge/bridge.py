@@ -164,15 +164,22 @@ def state():
 _audio_hub = None
 _loop = None
 
+SOUNDS_DIR = os.path.join(os.path.dirname(__file__), "sounds")
+
 _BUILTIN_AUDIO_MAP = {
     "obstacle_avoidance": 3001,
     "obstacle_avoidance_exit": 3002,
     "companion_mode": 3003,
     "companion_mode_exit": 3004,
-    "proximity_warning": 3001,
-    "proximity_alert": 3001,
-    "task_complete": 3003,
-    "test": 3001,
+}
+
+TTS_TEXT_MAP = {
+    "proximity_warning": "Warning, proximity alert",
+    "proximity_alert": "Warning, proximity alert",
+    "task_complete": "Task complete",
+    "test": "Audio test, system check okay",
+    "low_battery": "Warning, low battery",
+    "incident": "Warning, incident detected",
 }
 
 
@@ -182,26 +189,81 @@ def play_audio(sound_id):
         return jsonify({"status": "ok"}), 200
     if _audio_hub is None or _loop is None:
         return jsonify({"error": "audio hub not ready"}), 503
-    try:
-        api_id = _BUILTIN_AUDIO_MAP.get(str(sound_id).lower())
-        if api_id is None and str(sound_id).isdigit():
-            api_id = int(sound_id)
-        if api_id is None:
-            # Fallback to obstacle avoidance sound (3001) for any unmapped sound name
-            api_id = 3001
 
-        fut = asyncio.run_coroutine_threadsafe(
-            _audio_hub.data_channel.pub_sub.publish_request_new(
-                "rt/api/audiohub/request",
-                {"api_id": api_id, "parameter": "{}"}
-            ),
-            _loop
-        )
-        res = fut.result(timeout=5)
-        return jsonify({"status": "ok", "played": sound_id, "api_id": api_id, "result": res})
-    except Exception as exc:
-        logger.exception("audio play error")
-        return jsonify({"error": str(exc)}), 500
+    sid = str(sound_id).lower().strip()
+
+    # 1. Built-in Unitree system voice commands (e.g. obstacle_avoidance, companion_mode)
+    if sid in _BUILTIN_AUDIO_MAP or (sid.isdigit() and int(sid) in _BUILTIN_AUDIO_MAP.values()):
+        api_id = _BUILTIN_AUDIO_MAP.get(sid) or int(sid)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                _audio_hub.data_channel.pub_sub.publish_request_new(
+                    "rt/api/audiohub/request",
+                    {"api_id": api_id, "parameter": "{}"}
+                ),
+                _loop
+            )
+            res = fut.result(timeout=5)
+            return jsonify({"status": "ok", "played": sound_id, "mode": "builtin", "api_id": api_id, "result": res})
+        except Exception as exc:
+            logger.exception("audio play builtin error")
+            return jsonify({"error": str(exc)}), 500
+
+    # 2. Check for WAV or MP3 file in SOUNDS_DIR
+    target_file = None
+    for ext in ["", ".wav", ".mp3"]:
+        cand = os.path.join(SOUNDS_DIR, sid + ext)
+        if os.path.isfile(cand):
+            target_file = cand
+            break
+
+    if target_file and os.path.isfile(target_file):
+        async def _stream_file():
+            await _audio_hub.enter_megaphone()
+            await asyncio.sleep(0.3)
+            res = await _audio_hub.upload_megaphone(target_file)
+            await asyncio.sleep(0.5)
+            await _audio_hub.exit_megaphone()
+            return res
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_stream_file(), _loop)
+            res = fut.result(timeout=30)
+            return jsonify({"status": "ok", "played": sound_id, "mode": "file", "file": target_file, "result": res})
+        except Exception as exc:
+            logger.exception("audio play file error")
+            return jsonify({"error": str(exc)}), 500
+
+    # 3. Fallback to dynamically generated TTS for any unknown sound name!
+    text_to_say = TTS_TEXT_MAP.get(sid, f"Audio alert: {sid.replace('_', ' ')}")
+    tmp_path = f"/tmp/tts_{sid}.mp3"
+    try:
+        from gtts import gTTS
+        tts = gTTS(text=text_to_say, lang="en")
+        tts.save(tmp_path)
+    except Exception:
+        tmp_wav = f"/tmp/tts_{sid}.wav"
+        os.system(f'espeak-ng -w "{tmp_wav}" "{text_to_say}" || echo "TTS"')
+        tmp_path = tmp_wav
+
+    if os.path.isfile(tmp_path):
+        async def _stream_tts():
+            await _audio_hub.enter_megaphone()
+            await asyncio.sleep(0.3)
+            res = await _audio_hub.upload_megaphone(tmp_path)
+            await asyncio.sleep(0.5)
+            await _audio_hub.exit_megaphone()
+            return res
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_stream_tts(), _loop)
+            res = fut.result(timeout=30)
+            return jsonify({"status": "ok", "played": sound_id, "mode": "tts", "text": text_to_say, "result": res})
+        except Exception as exc:
+            logger.exception("audio play tts error")
+            return jsonify({"error": str(exc)}), 500
+
+    return jsonify({"error": f"sound_id {sound_id} could not be played"}), 400
 
 
 @app.route("/audio/megaphone", methods=["POST", "OPTIONS"])
@@ -240,15 +302,16 @@ def play_megaphone():
 def speak_text():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
-    data = request.json or {}
+    data = request.get_json(force=True, silent=True) or request.form or request.args or {}
     text = data.get("text", "")
+    lang = data.get("lang", "en")
     if not text:
         return jsonify({"error": "text required"}), 400
 
     tmp_path = "/tmp/tts_speech.mp3"
     try:
         from gtts import gTTS
-        tts = gTTS(text=text, lang="hu")
+        tts = gTTS(text=text, lang=lang)
         tts.save(tmp_path)
     except Exception:
         os.system(f'espeak-ng -w /tmp/tts_speech.wav "{text}" || echo "TTS"')
