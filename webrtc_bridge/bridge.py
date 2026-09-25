@@ -302,12 +302,35 @@ def play_megaphone():
 def speak_text():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
-    data = request.get_json(force=True, silent=True) or request.form or request.args or {}
-    text = data.get("text", "")
-    lang = data.get("lang", "en")
+
+    data = {}
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        pass
+
+    if not data:
+        data = request.form or request.args or {}
+
+    text = None
+    if isinstance(data, dict):
+        text = data.get("text") or data.get("msg")
+
+    if not text and request.data:
+        try:
+            raw = request.data.decode("utf-8", errors="ignore").strip()
+            if raw.startswith("{"):
+                parsed = json.loads(raw)
+                text = parsed.get("text") or parsed.get("msg")
+            else:
+                text = raw
+        except Exception:
+            text = request.data.decode("utf-8", errors="ignore").strip()
+
     if not text:
         return jsonify({"error": "text required"}), 400
 
+    lang = data.get("lang", "en") if isinstance(data, dict) else "en"
     tmp_path = "/tmp/tts_speech.mp3"
     try:
         from gtts import gTTS
@@ -331,7 +354,7 @@ def speak_text():
         if _audio_hub and _loop:
             fut = asyncio.run_coroutine_threadsafe(_stream_tts(), _loop)
             res = fut.result(timeout=30)
-            return jsonify({"status": "ok", "text": text, "result": res})
+            return jsonify({"status": "ok", "text": text, "lang": lang, "result": res})
         else:
             return jsonify({"status": "ok", "text": text, "simulated": True})
     except Exception as exc:
