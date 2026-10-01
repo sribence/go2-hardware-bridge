@@ -1,0 +1,9 @@
+numpy>=1.17
+opencv-python-headless>=4.2
+fastapi>=0.68
+uvicorn>=0.15
+pyyaml>=5.3
+pyserial>=3.4
+# tests only
+pytest
+httpx

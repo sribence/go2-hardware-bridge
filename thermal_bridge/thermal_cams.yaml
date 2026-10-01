@@ -1,0 +1,40 @@
+# thermal_bridge camera config. Override path with env THERMAL_CONFIG.
+# Use STABLE device paths: `ls -l /dev/v4l/by-id/` (or by-path/ if both
+# modules report the same serial -- then the USB port decides identity).
+# The device names below are PLACEHOLDERS -- replace with what by-id shows.
+cameras:
+  th_front_narrow:
+    device: /dev/v4l/by-id/usb-Xtherm_Inc._P2_Pro_NARROW-video-index0
+    decoder: infiray_p2        # infiray_p2 | tc001 | raw_y16 | grey8_relative
+    width: 256                 # thermal image size (after decoding)
+    height: 192
+    capture_width: 256         # V4L2 stream size requested (P2/TC001: 256x384 YUYV)
+    capture_height: 384
+    fourcc: YUYV
+    fps: 25
+    hfov_deg: 25.0             # narrow lens (estimate, ~25-35 deg) -- long range
+    fov_note: "narrow lens, front, long range (estimate before calibration)"
+    decoder_params: {thermal_half: bottom}
+    mock_offset_px: 0          # mock scene: horizontal shift of the walking person
+  th_front_wide:
+    device: /dev/v4l/by-id/usb-Xtherm_Inc._P2_Pro_WIDE-video-index0
+    decoder: infiray_p2
+    width: 256
+    height: 192
+    capture_width: 256
+    capture_height: 384
+    fourcc: YUYV
+    fps: 25
+    hfov_deg: 56.0             # wide lens (estimate, ~50-90 deg) -- near field
+    fov_note: "wide lens, front, near field (estimate before calibration)"
+    decoder_params: {thermal_half: bottom}
+    mock_offset_px: 0
+
+# Examples for other decoders:
+#   decoder: raw_y16
+#   decoder_params: {scale: 0.015625, offset: -273.15}   # degC = raw*scale+offset
+#   capture_height: 192
+#   fourcc: Y16
+#
+#   decoder: grey8_relative
+#   decoder_params: {t_min: 15.0, t_max: 40.0}           # AGC'd 8-bit -> RELATIVE degC

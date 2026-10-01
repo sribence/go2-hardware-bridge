@@ -1,0 +1,23 @@
+version: "3.8"
+
+# thermal_bridge -- separated from the robot's native system.
+# Device paths MUST match thermal_cams.yaml (check `ls -l /dev/v4l/by-id/`).
+# Mock without hardware:  THERMAL_MOCK=1 docker compose up
+services:
+  thermal_bridge:
+    build: .
+    image: nero_go2/thermal_bridge:latest
+    container_name: nero_go2_thermal_bridge
+    environment:
+      - THERMAL_PORT=9120
+      - THERMAL_MOCK=${THERMAL_MOCK:-0}
+    devices:
+      - /dev/v4l/by-id/usb-Xtherm_Inc._P2_Pro_NARROW-video-index0:/dev/v4l/by-id/usb-Xtherm_Inc._P2_Pro_NARROW-video-index0
+      - /dev/v4l/by-id/usb-Xtherm_Inc._P2_Pro_WIDE-video-index0:/dev/v4l/by-id/usb-Xtherm_Inc._P2_Pro_WIDE-video-index0
+    group_add:
+      - video
+    volumes:
+      - ./thermal_cams.yaml:/app/thermal_cams.yaml:ro
+    ports:
+      - "9120:9120"
+    restart: unless-stopped

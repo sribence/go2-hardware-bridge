@@ -1,0 +1,23 @@
+version: "3.8"
+
+# maixsense_bridge -- separated from the robot's native system.
+# Host device: prefer /dev/serial/by-id/... (stable); mapped to /dev/maixsense inside.
+# Mock without hardware:  MAIXSENSE_MOCK=1 docker compose up
+services:
+  maixsense_bridge:
+    build: .
+    image: nero_go2/maixsense_bridge:latest
+    container_name: nero_go2_maixsense_bridge
+    environment:
+      - MAIXSENSE_PORT=9121
+      - MAIXSENSE_DEVICE=/dev/maixsense
+      - MAIXSENSE_UNIT=0          # 0 = (p/5.1)^2 mm ; N = p*N mm
+      - MAIXSENSE_FPS=15          # 1..19
+      - MAIXSENSE_MOCK=${MAIXSENSE_MOCK:-0}
+    devices:
+      - ${MAIXSENSE_HOST_DEVICE:-/dev/ttyUSB0}:/dev/maixsense
+    group_add:
+      - dialout
+    ports:
+      - "9121:9121"
+    restart: unless-stopped
