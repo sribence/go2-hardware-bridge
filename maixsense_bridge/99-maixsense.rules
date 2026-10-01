@@ -1,0 +1,20 @@
+# Sipeed MaixSense A010 ToF -> stable /dev/maixsense
+# Install:  sudo cp 99-maixsense.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+#
+# VID:PID is NOT stated in any Sipeed source (MaixSense_ROS, MetaSense-ComTool, sipeed_wiki).
+# INFERRED: the wiki says the Type-C port enumerates as /dev/ttyUSBx (not ttyACM) and that Win7 needs
+# the *FTDI* driver; the A010's BL702 USB firmware therefore emulates an FTDI FT2232 (0403:6010, two
+# interfaces -> ttyUSB0 + ttyUSB1; the vendor ROS1 lib even defaults to /dev/ttyUSB1, msa010.hpp L13).
+# TODO(hardware): verify and pin the interface that answers "AT\r" with "OK\r\n":
+#   udevadm info -a -n /dev/ttyUSB0 | grep -E 'idVendor|idProduct|serial|bInterfaceNumber|product' | head
+#   lsusb | grep -i -E 'sipeed|0403|ftdi'
+# then fill in ATTRS{serial} and/or ENV{ID_USB_INTERFACE_NUM} below. Until then the bridge rejects the
+# wrong interface itself (no "OK" to "AT" -> reconnect loop with an error in /health.last_error).
+#
+# Only one A010 on the bus and only one FTDI dual-port device expected; GOTO avoids clobbering other
+# FTDI adapters if you add ATTRS{serial}=="..." on the first rule.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6010", ENV{ID_USB_INTERFACE_NUM}=="00", \
+  SYMLINK+="maixsense", MODE="0660", GROUP="dialout", TAG+="systemd"
+# Fallback if the data port turns out to be interface 01 (ROS1 default /dev/ttyUSB1):
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6010", ENV{ID_USB_INTERFACE_NUM}=="01", \
+  SYMLINK+="maixsense1", MODE="0660", GROUP="dialout"

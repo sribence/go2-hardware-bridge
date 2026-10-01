@@ -19,9 +19,14 @@ def test_at_commands():
     assert P.at("FPS", 15) == b"AT+FPS=15\r"
     assert P.at("UNIT", query=True) == b"AT+UNIT?\r"
     assert P.at("") == b"AT\r"
-    seq = P.init_sequence(unit=0, fps=10)
-    assert seq[0] == b"AT+ISP=0\r" and seq[-1] == b"AT+ISP=1\r"
-    assert b"AT+DISP=2\r" in seq and b"AT+UNIT=0\r" in seq and b"AT+FPS=10\r" in seq
+    seq = P.init_sequence(unit=0, fps=10, binn=2)
+    # vendor ROS handshake: ISP=0, DISP=1, ISP=1, AT ; then COEFF?, config, DISP=2 starts USB stream
+    assert seq[:5] == [b"AT+ISP=0\r", b"AT+DISP=1\r", b"AT+ISP=1\r", b"AT\r", b"AT+COEFF?\r"]
+    assert seq[-1] == b"AT+DISP=2\r"
+    assert b"AT+BINN=2\r" in seq and b"AT+UNIT=0\r" in seq and b"AT+FPS=10\r" in seq
+    assert b"AT+COEFF?\r" not in P.init_sequence(coeff=False)
+    with pytest.raises(ValueError):
+        P.init_sequence(binn=3)
     with pytest.raises(ValueError):
         P.init_sequence(fps=25)
 
@@ -73,7 +78,7 @@ def test_bad_checksum_rejected_and_resync():
 
 def test_bad_tail_rejected():
     pkt = bytearray(P.encode_frame(_codes(), 3))
-    pkt[-1] = 0xCC
+    pkt[-1] = 0x77
     p = P.FrameParser()
     assert p.feed(bytes(pkt)) == []
     assert p.stats.tail_errors >= 1
@@ -93,6 +98,29 @@ def test_binned_and_ir_frames():
     ir = np.full((25, 25), 9, np.uint8)
     f = P.FrameParser().feed(P.encode_frame(np.ones((25, 25), np.uint8), 2, output_mode=1, ir=ir))[0]
     assert f.ir is not None and np.array_equal(f.ir, ir)
+    # payload size must equal rows*cols (or 2x with output_mode=1), as in the vendor host example
+    bad = P.encode_frame(np.ones((25, 25), np.uint8), 3)
+    bad = bytearray(bad)
+    bad[14] = 20                                  # header claims 20x25 for a 625-byte payload
+    bad[-2] = sum(bad[:-2]) & 0xFF
+    p = P.FrameParser()
+    assert p.feed(bytes(bad)) == [] and p.stats.length_errors >= 1
+
+
+@pytest.mark.parametrize("binn,shape", [(1, (100, 100)), (2, (50, 50)), (4, (25, 25))])
+def test_all_binning_resolutions(binn, shape):
+    out = []
+    p = P.FrameParser()
+    for ch in P.fake_serial_stream(3, binn=binn, chunk=50):
+        out += p.feed(ch)
+    assert [f.depth.shape for f in out] == [shape] * 3
+
+
+def test_scale_intrinsics():
+    K = (75.0, 74.0, 49.5, 49.5)
+    assert P.scale_intrinsics(K, 100, 100) == pytest.approx(K)
+    assert P.scale_intrinsics(K, 50, 50) == pytest.approx((37.5, 37.0, 24.5, 24.5))
+    assert P.scale_intrinsics(K, 25, 25) == pytest.approx((18.75, 18.5, 12.0, 12.0))
 
 
 def test_depth_unit_conversion():

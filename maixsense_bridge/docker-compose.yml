@@ -1,7 +1,10 @@
 version: "3.8"
 
 # maixsense_bridge -- separated from the robot's native system.
-# Host device: prefer /dev/serial/by-id/... (stable); mapped to /dev/maixsense inside.
+# Host: install 99-maixsense.rules -> stable /dev/maixsense symlink (by USB VID:PID).
+# Hot-unplug/replug: a static `devices:` mapping pins the device node that existed at container
+# start and goes stale after a replug, so the host /dev is bind-mounted read-only instead and
+# ttyUSB (major 188) access is allowed via a cgroup rule; the bridge reopens /dev/maixsense itself.
 # Mock without hardware:  MAIXSENSE_MOCK=1 docker compose up
 services:
   maixsense_bridge:
@@ -10,12 +13,16 @@ services:
     container_name: nero_go2_maixsense_bridge
     environment:
       - MAIXSENSE_PORT=9121
-      - MAIXSENSE_DEVICE=/dev/maixsense
+      - MAIXSENSE_DEVICE=${MAIXSENSE_DEVICE:-/dev/maixsense}
       - MAIXSENSE_UNIT=0          # 0 = (p/5.1)^2 mm ; N = p*N mm
       - MAIXSENSE_FPS=15          # 1..19
+      - MAIXSENSE_BINN=1          # 1 = 100x100, 2 = 50x50, 4 = 25x25
+      - MAIXSENSE_RECONNECT_MAX_S=5
       - MAIXSENSE_MOCK=${MAIXSENSE_MOCK:-0}
-    devices:
-      - ${MAIXSENSE_HOST_DEVICE:-/dev/ttyUSB0}:/dev/maixsense
+    volumes:
+      - /dev:/dev:ro
+    device_cgroup_rules:
+      - "c 188:* rmw"             # ttyUSB* (ftdi_sio); add "c 166:* rmw" if it shows up as ttyACM*
     group_add:
       - dialout
     ports:

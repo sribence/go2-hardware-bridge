@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-"""maixsense_bridge -- Sipeed MaixSense A010 ToF (USB CDC serial) -> HTTP (FastAPI, :9121).
+"""maixsense_bridge -- Sipeed MaixSense A010 ToF (USB virtual serial, /dev/ttyUSBx) -> HTTP (FastAPI, :9121).
 
 OmniVision 360 contract (go2-brain-logic/mission_control/omni/CONTRACTS.md, F; cam_id tof_rear):
-  GET /frame.npy   (rows x cols, 100x100) float32 metres, 0 = invalid; header X-Capture-Time
+  GET /frame.npy   (rows, cols) float32 metres, 0 = invalid; rows x cols = 100x100 / 50x50 / 25x25
+                   for AT+BINN=1/2/4; headers X-Capture-Time, X-Resolution ("<rows>x<cols>"), X-Frame-Id
   GET /frame.png   turbo-colorized depth
   GET /points.npy  (N,3) float32 points in OpenCV cam frame (z fwd, x right, y down)
   GET /health      fps, checksum errors, last frame age, intrinsics
 
 Run:  python3 maixsense_bridge.py [--mock] [--device /dev/serial/by-id/...] [--port 9121]
-Config via env: MAIXSENSE_DEVICE, MAIXSENSE_BAUD, MAIXSENSE_UNIT, MAIXSENSE_FPS,
+Config via env: MAIXSENSE_DEVICE, MAIXSENSE_BAUD, MAIXSENSE_UNIT, MAIXSENSE_FPS, MAIXSENSE_BINN,
 MAIXSENSE_HFOV, MAIXSENSE_VFOV, MAIXSENSE_USE_COEFF, MAIXSENSE_MIN_M, MAIXSENSE_MAX_M.
 Read-only sensor bridge: never sends anything to the robot.
 """
 from __future__ import annotations
 
 import argparse
+import collections
 import io
 import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -37,10 +39,16 @@ def _env(name: str, default: str) -> str:
 
 
 class MaixSenseBridge:
-    def __init__(self, device: str = "/dev/ttyUSB0", baud: int = 115200, unit: int = 0, fps: int = 15,
+    def __init__(self, device: str = "/dev/maixsense", baud: int = 115200, unit: int = 0, fps: int = 15,
                  hfov_deg: float = P.DEFAULT_HFOV_DEG, vfov_deg: float = P.DEFAULT_VFOV_DEG,
-                 use_coeff: bool = True, min_m: float = 0.0, max_m: float = 10.0, mock: bool = False):
+                 use_coeff: bool = True, min_m: float = 0.0, max_m: float = 10.0, mock: bool = False,
+                 binn: int = 1, reconnect_max_s: float = 5.0, stall_s: float = 5.0):
+        P.config_sequence(unit, fps, P.DISP_USB, binn)  # validate ranges early
         self.device = device
+        self.binn = binn
+        self.reconnect_max_s = reconnect_max_s
+        self.stall_s = stall_s
+        self.opens = 0
         self.baud = baud
         self.unit = unit
         self.fps_cfg = fps
@@ -66,6 +74,7 @@ class MaixSenseBridge:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_fid: Optional[int] = None
+        self._t_hist: Deque[float] = collections.deque(maxlen=200)
         self._t_open = 0.0
 
     # ---- lifecycle -----------------------------------------------------
@@ -82,10 +91,8 @@ class MaixSenseBridge:
 
     # ---- frame handling ------------------------------------------------
     def intrinsics(self, rows: int = 100, cols: int = 100) -> Tuple[float, float, float, float]:
-        if self.coeff is not None:
-            s = cols / 100.0  # coeff is for the native 100x100 grid; scale for BINN
-            fx, fy, u0, v0 = self.coeff
-            return fx * s, fy * s, u0 * s, v0 * s
+        if self.coeff is not None:  # AT+COEFF? is for the native 100x100 grid; rescale for BINN
+            return P.scale_intrinsics(self.coeff, rows, cols)
         return P.intrinsics_from_fov(cols, rows, self.hfov_deg, self.vfov_deg)
 
     def feed(self, data: bytes, t: Optional[float] = None) -> int:
@@ -100,10 +107,13 @@ class MaixSenseBridge:
             self._last_fid = f.frame_id
             d = P.depth_meters(f.depth, self.unit, min_m=self.min_m, max_m=self.max_m)
             with self.lock:
-                if self.t_capture:
-                    dt = t - self.t_capture
-                    if dt > 0:
-                        self.fps = 1.0 / dt if self.fps == 0 else 0.9 * self.fps + 0.1 / dt
+                # fps over a sliding window of arrival times (robust to USB/pty burst delivery)
+                self._t_hist.append(t)
+                while len(self._t_hist) > 2 and t - self._t_hist[0] > 3.0:
+                    self._t_hist.popleft()
+                span = self._t_hist[-1] - self._t_hist[0]
+                if span > 0:
+                    self.fps = (len(self._t_hist) - 1) / span
                 self.depth_m = d
                 self.last_frame = f
                 self.t_capture = t
@@ -113,17 +123,22 @@ class MaixSenseBridge:
         with self.lock:
             return self.depth_m, self.t_capture
 
+    def latest_id(self) -> Optional[int]:
+        with self.lock:
+            return self.last_frame.frame_id if self.last_frame else None
+
     def health(self) -> Dict[str, Any]:
         st = self.parser.stats
         age = (time.time() - self.t_capture) if self.t_capture else None
         f = self.last_frame
-        rows, cols = (f.rows, f.cols) if f else (100, 100)
+        rows, cols = (f.rows, f.cols) if f else P.BINN_SHAPE[self.binn]
         return {
             "ok": age is not None and age < 2.0,
             "mock": self.mock,
             "device": self.device,
             "connected": self.connected,
             "unit": self.unit,
+            "binn": self.binn,
             "fps": round(self.fps, 2),
             "fps_cfg": self.fps_cfg,
             "frames": st.frames,
@@ -139,6 +154,7 @@ class MaixSenseBridge:
             "intrinsics": dict(zip(("fx", "fy", "cx", "cy"), self.intrinsics(rows, cols))),
             "intrinsics_source": "AT+COEFF?" if self.coeff else "fov %.0fx%.0f deg" % (self.hfov_deg, self.vfov_deg),
             "reconnects": self.reconnects,
+            "opens": self.opens,
             "last_error": self.last_error,
         }
 
@@ -146,7 +162,8 @@ class MaixSenseBridge:
     def mock_step(self, t: Optional[float] = None) -> int:
         t = time.time() if t is None else t
         fid = (self.parser.stats.frames + 1) & 0x0FFF
-        codes = P.mm_to_code(P.synth_depth_m(t - self.t_start) * 1000.0, self.unit)
+        rows, cols = P.BINN_SHAPE[self.binn]
+        codes = P.mm_to_code(P.synth_depth_m(t - self.t_start, cols, rows) * 1000.0, self.unit)
         self.connected = True
         return self.feed(P.encode_frame(codes, frame_id=fid), t)
 
@@ -170,34 +187,60 @@ class MaixSenseBridge:
                 pass
         self._ser = None
 
-    def _cmd(self, cmd: bytes, wait: float = 0.15) -> bytes:
-        self._ser.write(cmd)
-        self._ser.flush()
-        time.sleep(wait)
-        return self._ser.read(self._ser.in_waiting or 0)
+    def _xfer(self, cmd: bytes, expect: Optional[bytes] = None, quiet: float = 0.15,
+              max_s: float = 1.0) -> bytes:
+        """Write `cmd`, then read until `expect` is seen, or (no expect) until the line is quiet
+        for `quiet` s ([R] main.cc reads until an empty 1 s read), at most `max_s`."""
+        ser = self._ser
+        ser.write(cmd)
+        ser.flush()
+        buf, t_end, t_last = b"", time.time() + max_s, time.time()
+        while time.time() < t_end:
+            chunk = ser.read(ser.in_waiting or 1)
+            if chunk:
+                buf += chunk
+                t_last = time.time()
+                if expect is not None and expect in buf:
+                    break
+            elif expect is None and time.time() - t_last >= quiet:
+                break
+        return buf
 
     def _open(self) -> None:
         import serial  # pyserial, lazy so tests need no serial stack
 
-        self.reconnects += 1
-        ser = serial.Serial(self.device, self.baud, timeout=0.1)
+        self.opens += 1
+        if self.opens > 1:
+            self.reconnects += 1
+        # Baud is irrelevant on the USB port (wiki: "choose any high baud rate"); only the 4-pin UART
+        # uses AT+BAUD. Vendor ROS uses 115200 8N1, vendor host example 921600.
+        ser = serial.Serial(self.device, self.baud, timeout=0.05)
         self._ser = ser
-        self._cmd(P.at("ISP", 0), 0.3)  # stop streaming first
+        hs = P.handshake_sequence()
+        for c in hs[:-1]:                     # ISP=0, DISP=1 (USB stream off), ISP=1; drain each
+            self._xfer(c, quiet=0.2, max_s=2.0)
         ser.reset_input_buffer()
+        r = self._xfer(hs[-1], expect=b"OK\r\n", max_s=1.0)
+        if not P.is_ok(r):
+            raise IOError("no OK to AT (not an A010 port?): %r" % r[:40])
         if self.use_coeff and self.coeff is None:
-            ser.write(P.at("COEFF", query=True))
-            deadline, resp = time.time() + 1.5, b""
-            while time.time() < deadline and b"}" not in resp:
-                resp += ser.read(512)
-            self.coeff = P.parse_coeff(resp.decode("ascii", "ignore"))
+            r = self._xfer(P.at("COEFF", query=True), expect=b"}", max_s=1.5)
+            self.coeff = P.parse_coeff(r.decode("ascii", "ignore"))
+            if not r.startswith(P.COEFF_ACK.encode("ascii")):
+                log.warning("unexpected AT+COEFF? reply prefix: %r", r[:24])
             log.info("AT+COEFF? -> %s", self.coeff)
-        for c in P.init_sequence(unit=self.unit, fps=self.fps_cfg, disp=P.DISP_USB)[1:]:
-            self._cmd(c)
+        cfg = P.config_sequence(unit=self.unit, fps=self.fps_cfg, disp=P.DISP_USB, binn=self.binn)
         self.parser.reset()
+        for c in cfg[:-1]:
+            if not P.is_ok(self._xfer(c, expect=b"OK\r\n", max_s=0.5)):
+                log.warning("no OK for %r", c)
+        ser.write(cfg[-1])                    # DISP=2: USB streaming starts; the OK is parser garbage
+        ser.flush()
+        self._last_fid = None
         self._t_open = time.time()
         self.connected = True
         self.last_error = ""
-        log.info("opened %s @ %d (unit=%d fps=%d)", self.device, self.baud, self.unit, self.fps_cfg)
+        log.info("opened %s (unit=%d fps=%d binn=%d)", self.device, self.unit, self.fps_cfg, self.binn)
 
     def _run_serial(self) -> None:
         backoff = 0.5
@@ -206,17 +249,17 @@ class MaixSenseBridge:
                 if self._ser is None:
                     self._open()
                     backoff = 0.5
-                data = self._ser.read(max(1, min(8192, self._ser.in_waiting or 1)))
+                data = self._ser.read(max(1, min(16384, self._ser.in_waiting or 1)))
                 if data:
                     self.feed(data)
-                elif time.time() - max(self.t_capture, self._t_open) > 5.0:
-                    raise IOError("no valid frames for 5 s")
-            except Exception as e:  # unplugged, permission, timeout...
+                elif time.time() - max(self.t_capture, self._t_open) > self.stall_s:
+                    raise IOError("no valid frames for %.1f s" % self.stall_s)
+            except Exception as e:  # unplugged (SerialException/OSError), permission, timeout...
                 self.last_error = str(e)
                 log.warning("serial error: %s (retry in %.1fs)", e, backoff)
                 self._close()
                 self._stop.wait(backoff)
-                backoff = min(backoff * 2.0, 10.0)
+                backoff = min(backoff * 2.0, self.reconnect_max_s)
 
 
 # --------------------------------------------------------------------------
@@ -241,7 +284,7 @@ def create_app(bridge: MaixSenseBridge):
 
     app = FastAPI(title="maixsense_bridge", version="1.0")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"],
-                       expose_headers=["X-Capture-Time", "X-Points"])
+                       expose_headers=["X-Capture-Time", "X-Points", "X-Resolution", "X-Frame-Id"])
 
     def _latest():
         d, t = bridge.latest()
@@ -253,6 +296,9 @@ def create_app(bridge: MaixSenseBridge):
         bio = io.BytesIO()
         np.save(bio, arr.astype(np.float32), allow_pickle=False)
         h = {"X-Capture-Time": "%.6f" % t, "Cache-Control": "no-store"}
+        fid = bridge.latest_id()
+        if fid is not None:
+            h["X-Frame-Id"] = str(fid)
         h.update(extra or {})
         return Response(bio.getvalue(), media_type="application/octet-stream", headers=h)
 
@@ -263,7 +309,7 @@ def create_app(bridge: MaixSenseBridge):
     @app.get("/frame.npy")
     def frame_npy():
         d, t = _latest()
-        return _npy(d, t)
+        return _npy(d, t, {"X-Resolution": "%dx%d" % d.shape})
 
     @app.get("/frame.png")
     def frame_png(max_m: float = 2.5):
@@ -275,7 +321,7 @@ def create_app(bridge: MaixSenseBridge):
     def points_npy():
         d, t = _latest()
         pts = P.depth_to_points(d, bridge.intrinsics(d.shape[0], d.shape[1]))
-        return _npy(pts, t, {"X-Points": str(len(pts))})
+        return _npy(pts, t, {"X-Points": str(len(pts)), "X-Resolution": "%dx%d" % d.shape})
 
     return app
 
@@ -283,10 +329,13 @@ def create_app(bridge: MaixSenseBridge):
 def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mock", action="store_true", default=_env("MAIXSENSE_MOCK", "0") == "1")
-    ap.add_argument("--device", default=_env("MAIXSENSE_DEVICE", "/dev/ttyUSB0"))
+    ap.add_argument("--device", default=_env("MAIXSENSE_DEVICE", "/dev/maixsense"))
     ap.add_argument("--baud", type=int, default=int(_env("MAIXSENSE_BAUD", "115200")))
     ap.add_argument("--unit", type=int, default=int(_env("MAIXSENSE_UNIT", "0")))
     ap.add_argument("--fps", type=int, default=int(_env("MAIXSENSE_FPS", "15")))
+    ap.add_argument("--binn", type=int, choices=(1, 2, 4), default=int(_env("MAIXSENSE_BINN", "1")),
+                    help="AT+BINN: 1=100x100, 2=50x50, 4=25x25")
+    ap.add_argument("--reconnect-max-s", type=float, default=float(_env("MAIXSENSE_RECONNECT_MAX_S", "5")))
     ap.add_argument("--hfov", type=float, default=float(_env("MAIXSENSE_HFOV", str(P.DEFAULT_HFOV_DEG))))
     ap.add_argument("--vfov", type=float, default=float(_env("MAIXSENSE_VFOV", str(P.DEFAULT_VFOV_DEG))))
     ap.add_argument("--no-coeff", action="store_true", default=_env("MAIXSENSE_USE_COEFF", "1") == "0",
@@ -299,7 +348,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
     bridge = MaixSenseBridge(a.device, a.baud, a.unit, a.fps, a.hfov, a.vfov, not a.no_coeff,
-                             a.min_m, a.max_m, mock=a.mock)
+                             a.min_m, a.max_m, mock=a.mock, binn=a.binn, reconnect_max_s=a.reconnect_max_s)
     bridge.start()
     import uvicorn
 

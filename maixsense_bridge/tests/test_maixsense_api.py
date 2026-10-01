@@ -58,3 +58,20 @@ def test_feed_fake_serial_stream_with_corruption():
 def test_no_frame_503():
     c = TestClient(MB.create_app(MB.MaixSenseBridge(mock=True)))
     assert c.get("/frame.npy").status_code == 503
+
+
+@pytest.mark.parametrize("binn,shape", [(1, (100, 100)), (2, (50, 50)), (4, (25, 25))])
+def test_mock_binning_resolution_header(binn, shape):
+    b = MB.MaixSenseBridge(mock=True, binn=binn)
+    b.mock_step(t=b.t_start + 1.0)
+    c = TestClient(MB.create_app(b))
+    r = c.get("/frame.npy")
+    assert r.headers["X-Resolution"] == "%dx%d" % shape and r.headers["X-Frame-Id"] == "1"
+    assert np.load(io.BytesIO(r.content)).shape == shape
+    assert c.get("/points.npy").headers["X-Resolution"] == "%dx%d" % shape
+    assert c.get("/health").json()["resolution"] == list(shape)
+
+
+def test_bad_binn_rejected():
+    with pytest.raises(ValueError):
+        MB.MaixSenseBridge(mock=True, binn=3)

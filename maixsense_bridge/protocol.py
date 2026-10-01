@@ -4,7 +4,10 @@ Sources (see README "Protocol provenance"):
   [W] https://wiki.sipeed.com/hardware/en/maixsense/maixsense-a010/at_command_en.html
       (raw: github.com/sipeed/sipeed_wiki docs/hardware/en/maixsense/maixsense-a010/at_command_en.md)
   [C] github.com/sipeed/sipeed_wiki docs/hardware/zh/maixsense/maixsense-a010/code.md (Python examples)
-  [R] github.com/sipeed/MaixSense_ROS sipeed_tof_ms_a010_ros/ros2/src/frame_struct.h, frame_handle.cc, main.cc
+  [R] github.com/sipeed/MaixSense_ROS @34c2fac sipeed_tof_ms_a010_ros/{ros1,ros2}/src (frame_struct.h,
+      frame_handle.cc, main.cc, serial.cc, sipeed_tof_ms_a010_node.cc, msa010.hpp)
+  [T] github.com/sipeed/MetaSense-ComTool @1ba2687 COMTool/plugins/gragh_widgets.py (Gragh_MetaSenseLite,
+      the official A010 PC viewer)
 
 Packet (all multi-byte fields little-endian) [W][R]:
   off  size  field
@@ -24,8 +27,9 @@ Packet (all multi-byte fields little-endian) [W][R]:
   19    1    reserved3 (0xFF)
   20    N    payload: rows*cols uint8 depth codes (row-major)
   20+N  1    checksum = sum(bytes[0 : 20+N]) & 0xFF
-  21+N  1    tail 0xDD
-Depth [W]: UNIT=0 -> d_mm = (p/5.1)^2 ; UNIT=k (1..10) -> d_mm = p*k.
+  21+N  1    tail 0xDD ([R][T]; the vendor USB host example [C] also accepts 0xCC)
+Depth [W][T]: UNIT=0 -> d_mm = (p/5.1)^2 ; UNIT=k (1..10) -> d_mm = p*k.
+Resolution: AT+BINN=1/2/4 -> 100x100 / 50x50 / 25x25 [W]; rows/cols come from bytes 14/15.
 """
 from __future__ import annotations
 
@@ -40,15 +44,23 @@ import numpy as np
 
 HEADER = b"\x00\xFF"
 TAIL = 0xDD
+TAILS = (0xDD, 0xCC)    # [C] ALLOWED_TAILS = (0xCC, 0xDD); [R]/[T] check 0xDD only
 HEAD_SIZE = 20          # header(2) + len(2) + metadata(16)
 META_SIZE = 16
-MAX_PAYLOAD = 100 * 100 * 2  # depth+IR worst case; [R] caps depth-only at 100*100
+MAX_PAYLOAD = 100 * 100 * 2  # depth+IR worst case (ASSUMED layout); [R] caps at 100*100
+BINN_SHAPE = {1: (100, 100), 2: (50, 50), 4: (25, 25)}  # [W] AT+BINN
+COEFF_SCALE = 262144.0   # u14p18 fixed point [R] frame_struct.h LensCoeff_t, main.cc /262144.0f
+COEFF_ACK = "+COEFF=1\r\nOK\r\n"  # [R] main.cc: exact first reply, JSON follows in the next read
 
 # AT+BAUD index -> baud rate [W]
 BAUD_TABLE = {0: 9600, 1: 57600, 2: 115200, 3: 230400, 4: 460800, 5: 921600,
               6: 1000000, 7: 2000000, 8: 3000000}
 # AT+DISP values [W]
 DISP_OFF, DISP_LCD, DISP_USB, DISP_LCD_USB, DISP_UART = 0, 1, 2, 3, 4
+# settable AT commands and their value ranges [W]; ANTIMMI/AE/EV only in [W]/[T]
+AT_RANGES = {"ISP": range(0, 2), "BINN": (1, 2, 4), "DISP": range(0, 8), "BAUD": range(0, 9),
+             "UNIT": range(0, 11), "FPS": range(1, 20), "ANTIMMI": range(-1, 42), "AE": range(0, 2),
+             "EV": range(0, 40001)}
 
 DEFAULT_HFOV_DEG = 70.0  # ASSUMED (contract / vendor listings), not in wiki pages fetched
 DEFAULT_VFOV_DEG = 60.0
@@ -69,39 +81,71 @@ def at(cmd: str, value: Optional[object] = None, query: bool = False) -> bytes:
     return ("AT+%s=%s\r" % (cmd, value)).encode("ascii")
 
 
-def init_sequence(unit: int = 0, fps: int = 15, disp: int = DISP_USB, binn: int = 1) -> List[bytes]:
-    """stop ISP -> configure -> start ISP. Values validated against [W] ranges."""
+def handshake_sequence() -> List[bytes]:
+    """[R] ros2 main.cc L37-66: ISP off, USB stream off (LCD only), ISP on, then `AT` must answer
+    exactly b'OK\\r\\n' ("not this serial port" otherwise). The host drains input after each."""
+    return [at("ISP", 0), at("DISP", DISP_LCD), at("ISP", 1), at("")]
+
+
+def config_sequence(unit: int = 0, fps: int = 15, disp: int = DISP_USB, binn: int = 1) -> List[bytes]:
+    """Commands sent after the handshake/COEFF query; the last one (DISP) starts USB streaming."""
     if not 0 <= unit <= 10:
         raise ValueError("UNIT must be 0..10")
     if not 1 <= fps <= 19:
         raise ValueError("FPS must be 1..19")
     if not 0 <= disp <= 7:
         raise ValueError("DISP must be 0..7")
-    if binn not in (1, 2, 4):
+    if binn not in BINN_SHAPE:
         raise ValueError("BINN must be 1, 2 or 4")
-    return [
-        at("ISP", 0),       # stop: ISP off, IR emitter off
-        at("BINN", binn),
-        at("UNIT", unit),
-        at("FPS", fps),
-        at("DISP", disp),   # 2 = USB output only (LCD off saves bandwidth)
-        at("ISP", 1),       # start: frames follow after ~1-2 s
-    ]
+    return [at("BINN", binn), at("UNIT", unit), at("FPS", fps), at("DISP", disp)]
+
+
+def init_sequence(unit: int = 0, fps: int = 15, disp: int = DISP_USB, binn: int = 1,
+                  coeff: bool = True) -> List[bytes]:
+    """Full host->device sequence: handshake, optional AT+COEFF?, config (ends with DISP=2)."""
+    cfg = config_sequence(unit, fps, disp, binn)
+    return handshake_sequence() + ([at("COEFF", query=True)] if coeff else []) + cfg
+
+
+def is_ok(reply: bytes) -> bool:
+    return b"OK\r\n" in reply
 
 
 def parse_coeff(text: str) -> Optional[Tuple[float, float, float, float]]:
-    """Parse the JSON returned by AT+COEFF? -> (fx, fy, u0, v0) in pixels.
+    """Parse the AT+COEFF? reply -> (fx, fy, u0, v0) in pixels of the 100x100 grid.
 
-    [R] main.cc: values are u14p18 fixed point -> divide by 262144.
+    Reply [R] main.cc L69-94 / node.cc L68-89: b'+COEFF=1\\r\\nOK\\r\\n' then a JSON object whose
+    integer fields fx, fy, u0, v0 are u14p18 fixed point: value = valueint / 262144.0f (float32).
     """
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
         return None
     try:
         d = json.loads(m.group(0))
-        return tuple(float(d[k]) / 262144.0 for k in ("fx", "fy", "u0", "v0"))  # type: ignore
+        # cJSON valueint truncates toward zero; float32 division like the vendor code
+        vals = [float(np.float32(int(d[k])) / np.float32(COEFF_SCALE)) for k in ("fx", "fy", "u0", "v0")]
     except (ValueError, KeyError, TypeError):
         return None
+    if vals[0] <= 0 or vals[1] <= 0:
+        return None
+    return tuple(vals)  # type: ignore
+
+
+def encode_coeff_reply(fx: float, fy: float, u0: float, v0: float, extra: Optional[dict] = None) -> Tuple[bytes, bytes]:
+    """(ack, json) as the fake device sends them; the JSON keys follow [R] LensCoeff_t."""
+    d = {"cali_mode": 0}
+    d.update({k: int(round(v * COEFF_SCALE)) for k, v in (("fx", fx), ("fy", fy), ("u0", u0), ("v0", v0))})
+    d.update(extra or {})
+    return COEFF_ACK.encode("ascii"), (json.dumps(d) + "\r\n").encode("ascii")
+
+
+def scale_intrinsics(K: Tuple[float, float, float, float], rows: int, cols: int,
+                     native: int = 100) -> Tuple[float, float, float, float]:
+    """Rescale 100x100 intrinsics to a binned grid (ASSUMPTION: COEFF is always for 100x100).
+    Principal point uses the pixel-centre convention: c' = (c + 0.5) * s - 0.5."""
+    fx, fy, u0, v0 = K
+    sx, sy = cols / float(native), rows / float(native)
+    return fx * sx, fy * sy, (u0 + 0.5) * sx - 0.5, (v0 + 0.5) * sy - 0.5
 
 
 # --------------------------------------------------------------------------
@@ -129,7 +173,7 @@ def checksum(data: bytes) -> int:
 def encode_frame(depth: np.ndarray, frame_id: int = 0, output_mode: int = 0,
                  sensor_temp: int = 30, driver_temp: int = 32, exposure_time: int = 1000,
                  error_code: int = 0, isp_version: int = 1, ir: Optional[np.ndarray] = None,
-                 corrupt_checksum: bool = False) -> bytes:
+                 corrupt_checksum: bool = False, tail: int = TAIL) -> bytes:
     """Build a byte-exact A010 packet (fake-serial generator for mock + tests)."""
     d = np.ascontiguousarray(depth, dtype=np.uint8)
     rows, cols = d.shape
@@ -144,7 +188,7 @@ def encode_frame(depth: np.ndarray, frame_id: int = 0, output_mode: int = 0,
     cs = checksum(body)
     if corrupt_checksum:
         cs = (cs + 1) & 0xFF
-    return body + bytes((cs, TAIL))
+    return body + bytes((cs, tail))
 
 
 @dataclass
@@ -163,7 +207,8 @@ class FrameParser:
     a real header hidden inside garbage/pixel data is still found.
     """
 
-    def __init__(self, max_buffer: int = 1 << 16):
+    def __init__(self, max_buffer: int = 1 << 16, tails: Sequence[int] = TAILS):
+        self.tails = tuple(tails)
         self.buf = bytearray()
         self.stats = ParserStats()
         self.max_buffer = max_buffer
@@ -202,7 +247,7 @@ class FrameParser:
                     continue
                 break
             pkt = bytes(self.buf[:total])
-            if pkt[-1] != TAIL:
+            if pkt[-1] not in self.tails:
                 self.stats.tail_errors += 1
                 self._drop(1)
                 continue
@@ -225,11 +270,12 @@ class FrameParser:
         (_r1, mode, s_temp, d_temp, exp, err, _r2, rows, cols, fid, isp, _r3) = struct.unpack_from(
             "<BBBBIBBBBHBB", pkt, 4)
         n = rows * cols
-        if n == 0 or payload_len < n:
+        # [C] drops frames whose payload != rows*cols; depth+IR (mode 1) = 2n is ASSUMED
+        if n == 0 or not (payload_len == n or (mode == 1 and payload_len == 2 * n)):
             return None
         payload = np.frombuffer(pkt, dtype=np.uint8, count=payload_len, offset=HEAD_SIZE)
         depth = payload[:n].reshape(rows, cols).copy()
-        ir = payload[n:2 * n].reshape(rows, cols).copy() if (mode == 1 and payload_len >= 2 * n) else None
+        ir = payload[n:2 * n].reshape(rows, cols).copy() if payload_len == 2 * n else None
         return A010Frame(frame_id=fid & 0x0FFF, rows=rows, cols=cols, output_mode=mode,
                          sensor_temp=s_temp, driver_temp=d_temp, exposure_time=exp,
                          error_code=err, isp_version=isp, depth=depth, ir=ir)
@@ -277,8 +323,9 @@ def intrinsics_from_fov(width: int = 100, height: int = 100, hfov_deg: float = D
 def depth_to_points(depth_m: np.ndarray, K: Tuple[float, float, float, float]) -> np.ndarray:
     """(H,W) metres -> (N,3) float32 points in OpenCV cam frame (z fwd, x right, y down).
 
-    The A010 value is used as z (as in [R] main.cc point-cloud code); invalid
-    (0) pixels are dropped.
+    Matches [R] ros2 main.cc L194-199: x = d*(i-u0)/fx, y = d*(j-v0)/fy, z = d with integer
+    pixel indices i, j -- the A010 value is z-depth, not range along the ray. (ros1 node.cc
+    L168-176 is the same point in ROS axes: x, y=d, z=-y_cv.) Invalid (0) pixels are dropped.
     """
     fx, fy, cx, cy = K
     h, w = depth_m.shape
@@ -310,12 +357,13 @@ def synth_depth_m(t: float, width: int = 100, height: int = 100) -> np.ndarray:
 
 def fake_serial_stream(n_frames: int, unit: int = 0, garbage: bytes = b"",
                        chunk: int = 0, t0: float = 0.0, dt: float = 0.1,
-                       noise_bytes: bytes = b"", first_id: int = 0) -> Iterator[bytes]:
+                       noise_bytes: bytes = b"", first_id: int = 0, binn: int = 1) -> Iterator[bytes]:
     """Byte stream identical to the real device: optional leading garbage,
     then n_frames packets, optionally split into `chunk`-sized pieces."""
     data = bytearray(garbage)
     for i in range(n_frames):
-        codes = mm_to_code(synth_depth_m(t0 + i * dt) * 1000.0, unit)
+        rows, cols = BINN_SHAPE[binn]
+        codes = mm_to_code(synth_depth_m(t0 + i * dt, cols, rows) * 1000.0, unit)
         data += encode_frame(codes, frame_id=first_id + i)
         data += noise_bytes
     if chunk <= 0:
