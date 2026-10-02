@@ -1,0 +1,112 @@
+# gamepad_bridge config + per-pad profiles.
+# Logical buttons are POSITIONAL (Xbox naming): a = bottom, b = right, x = left, y = top.
+# Code names are Linux input-event-codes.h names. Verify a new pad with `evtest` and remap here.
+# Axis ranges come from the device absinfo (no hard-coded ranges); `invert` defaults to true for ly/ry
+# (evdev Y is down-positive, logical Y is up-positive).
+
+bridge:
+  pad_priority: []            # name substrings, first match wins (e.g. ["Xbox", "DualSense"]); empty = first pad found
+  force_profile: ""           # profile name to force for every pad ("" = auto-match)
+  rescan_s: 2.0               # hotplug rescan period
+  liveness_siblings: true     # also count events of sibling nodes (same uniq: DS4/DualSense/Switch IMU) as liveness
+  rumble: true
+
+control:
+  move_hz: 20
+  deadman_hz: 10
+  stale_input_s: 0.5          # no input event for this long while moving -> one /stop
+  deadman_stale_s: 3.0        # no input event for this long -> stop dead-man heartbeats
+  estop_hold_s: 2.0           # Start+Select held -> E-STOP
+  trigger_on: 0.6             # LT/RT press threshold (hysteresis to trigger_off)
+  trigger_off: 0.3
+  default_level: normal
+  allow_sprint: false         # sprint level only if true; still dead-man gated (safety_guard caps by source)
+  stand_requires_deadman: true
+  assume_standing: true       # first Y = sit
+  levels:                     # m/s, m/s, rad/s at full stick; safety_guard still applies its own caps
+    stealth: {vx: 0.25, vy: 0.15, vyaw: 0.5}
+    normal:  {vx: 0.6,  vy: 0.3,  vyaw: 1.0}
+    sprint:  {vx: 1.5,  vy: 0.4,  vyaw: 1.5}
+  actions:                    # logical button -> stop | stand_sit | mission_toggle | capture | none
+    a: mission_toggle
+    b: stop
+    x: capture
+    y: stand_sit
+
+defaults:
+  deadzone: 0.12              # radial stick deadzone (logical units), max'd with absinfo.flat
+  trigger_deadzone: 0.05
+
+profiles:                     # YAML order = tie-break priority; ids "vvvv:pppp" beat names beat `any`
+  xbox_xpadneo:               # Xbox One/Series over BT, xpadneo (recommended driver for BT)
+    label: Xbox Wireless (xpadneo)
+    match: {names: ["Xbox Wireless Controller"], ids: ["045e:02e0", "045e:02fd", "045e:0b05", "045e:0b13", "045e:0b20", "045e:0b22"]}
+    axes: {lx: ABS_X, ly: ABS_Y, rx: ABS_RX, ry: ABS_RY}
+    triggers: {lt: {abs: ABS_Z}, rt: {abs: ABS_RZ}}
+    # xpad/xpadneo historically emit BTN_X(0x133) for X and BTN_Y(0x134) for Y; swap if evtest disagrees
+    buttons: {a: BTN_SOUTH, b: BTN_EAST, x: BTN_X, y: BTN_Y, lb: BTN_TL, rb: BTN_TR,
+              start: BTN_START, select: BTN_SELECT, home: BTN_MODE, ls: BTN_THUMBL, rs: BTN_THUMBR}
+
+  xbox_xpad:                  # kernel xpad: wired/2.4G Xbox 360/One, 8BitDo in X-input mode
+    label: Xbox / X-input (xpad)
+    match: {names: ["X-Box", "Xbox 360", "XInput", "8BitDo.*X-?input"], ids: ["045e:028e", "045e:028f", "045e:02ea", "045e:0b12", "2dc8:3106"]}
+    axes: {lx: ABS_X, ly: ABS_Y, rx: ABS_RX, ry: ABS_RY}
+    triggers: {lt: {abs: ABS_Z}, rt: {abs: ABS_RZ}}
+    buttons: {a: BTN_SOUTH, b: BTN_EAST, x: BTN_X, y: BTN_Y, lb: BTN_TL, rb: BTN_TR,
+              start: BTN_START, select: BTN_SELECT, home: BTN_MODE, ls: BTN_THUMBL, rs: BTN_THUMBR}
+
+  dualsense:                  # DualSense via hid-playstation (kernel >= 5.12)
+    label: DualSense (hid-playstation)
+    match: {names: ["DualSense Wireless Controller$"], ids: ["054c:0ce6", "054c:0df2"], excludes: [BTN_C]}
+    axes: {lx: ABS_X, ly: ABS_Y, rx: ABS_RX, ry: ABS_RY}
+    triggers: {lt: {abs: ABS_Z}, rt: {abs: ABS_RZ}}
+    buttons: {a: BTN_SOUTH, b: BTN_EAST, x: BTN_WEST, y: BTN_NORTH, lb: BTN_TL, rb: BTN_TR,
+              start: BTN_START, select: BTN_SELECT, home: BTN_MODE, ls: BTN_THUMBL, rs: BTN_THUMBR}
+
+  dualsense_hidgeneric:       # DualSense on older kernels (Jetson L4T 5.10 has no hid-playstation)
+    label: DualSense (hid-generic)
+    match: {ids: ["054c:0ce6", "054c:0df2"], requires: [BTN_C]}
+    axes: {lx: ABS_X, ly: ABS_Y, rx: ABS_Z, ry: ABS_RZ}
+    triggers: {lt: {abs: ABS_RX}, rt: {abs: ABS_RY}}
+    buttons: {x: BTN_SOUTH, a: BTN_EAST, b: BTN_C, y: BTN_NORTH, lb: BTN_WEST, rb: BTN_Z,
+              select: BTN_TL2, start: BTN_TR2, home: BTN_MODE, ls: BTN_SELECT, rs: BTN_START}
+
+  dualshock4:                 # DS4 v1/v2 via hid-sony (kernel >= 4.10 layout)
+    label: DualShock 4
+    match: {names: ["^(Sony Interactive Entertainment |Sony Computer Entertainment )?Wireless Controller$"], ids: ["054c:05c4", "054c:09cc", "054c:0ba0"], excludes: [BTN_C]}
+    axes: {lx: ABS_X, ly: ABS_Y, rx: ABS_RX, ry: ABS_RY}
+    triggers: {lt: {abs: ABS_Z}, rt: {abs: ABS_RZ}}
+    buttons: {a: BTN_SOUTH, b: BTN_EAST, x: BTN_WEST, y: BTN_NORTH, lb: BTN_TL, rb: BTN_TR,
+              start: BTN_START, select: BTN_SELECT, home: BTN_MODE, ls: BTN_THUMBL, rs: BTN_THUMBR}
+
+  switch_pro:                 # Switch Pro / 8BitDo in Switch mode, hid-nintendo (kernel >= 5.16 or dkms)
+    label: Switch Pro (hid-nintendo)
+    match: {names: ["Nintendo Switch Pro Controller$", "^Pro Controller$"], ids: ["057e:2009"]}
+    axes: {lx: ABS_X, ly: ABS_Y, rx: ABS_RX, ry: ABS_RY}
+    triggers: {lt: {btn: BTN_TL2}, rt: {btn: BTN_TR2}}        # ZL/ZR are digital
+    buttons: {a: BTN_SOUTH, b: BTN_EAST, x: BTN_WEST, y: BTN_NORTH, lb: BTN_TL, rb: BTN_TR,
+              start: BTN_START, select: BTN_SELECT, home: BTN_MODE, ls: BTN_THUMBL, rs: BTN_THUMBR}
+
+  eightbitdo_dinput:          # 8BitDo (Pro 2, SN30 Pro, Ultimate) in D-input / Android mode, hid-generic
+    label: 8BitDo D-input
+    match: {names: ["^8BitDo"], requires: [ABS_GAS]}
+    axes: {lx: ABS_X, ly: ABS_Y, rx: ABS_Z, ry: ABS_RZ}
+    triggers: {lt: {abs: ABS_BRAKE}, rt: {abs: ABS_GAS}}
+    buttons: {a: BTN_EAST, b: BTN_SOUTH, x: BTN_WEST, y: BTN_NORTH, lb: BTN_TL, rb: BTN_TR,
+              select: BTN_SELECT, start: BTN_START, home: BTN_MODE, ls: BTN_THUMBL, rs: BTN_THUMBR}
+
+  generic_gamepad:            # anything with BTN_SOUTH + sticks (spec-conformant drivers)
+    label: Generic gamepad
+    match: {any: true, requires: [BTN_SOUTH, ABS_RX]}
+    axes: {lx: ABS_X, ly: ABS_Y, rx: ABS_RX, ry: ABS_RY}
+    triggers: {lt: {abs: ABS_Z, btn: BTN_TL2}, rt: {abs: ABS_RZ, btn: BTN_TR2}}
+    buttons: {a: BTN_SOUTH, b: BTN_EAST, x: BTN_WEST, y: BTN_NORTH, lb: BTN_TL, rb: BTN_TR,
+              start: BTN_START, select: BTN_SELECT, home: BTN_MODE, ls: BTN_THUMBL, rs: BTN_THUMBR}
+
+  generic_hid:                # cheap HID pads: right stick on ABS_Z/ABS_RZ, digital triggers
+    label: Generic HID
+    match: {any: true}
+    axes: {lx: ABS_X, ly: ABS_Y, rx: ABS_Z, ry: ABS_RZ}
+    triggers: {lt: {abs: ABS_BRAKE, btn: BTN_TL2}, rt: {abs: ABS_GAS, btn: BTN_TR2}}
+    buttons: {a: BTN_SOUTH, b: BTN_EAST, x: BTN_WEST, y: BTN_NORTH, lb: BTN_TL, rb: BTN_TR,
+              start: BTN_START, select: BTN_SELECT, home: BTN_MODE, ls: BTN_THUMBL, rs: BTN_THUMBR}
