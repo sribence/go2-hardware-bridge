@@ -183,6 +183,71 @@ TTS_TEXT_MAP = {
 }
 
 
+import wave
+
+def prepare_audio_for_megaphone(input_path: str, output_path: str) -> float:
+    """Resamples input audio file to 16,000 Hz 16-bit Mono PCM WAV required by Unitree Go2 Megaphone hardware decoder.
+    Returns duration in seconds.
+    """
+    try:
+        from pydub import AudioSegment
+        audio = AudioSegment.from_file(input_path)
+        duration = float(audio.duration_seconds)
+        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        audio.export(output_path, format="wav")
+        return duration
+    except Exception as exc:
+        logger.warning("pydub audio resample warning: %s, attempting ffmpeg...", exc)
+        os.system(f'ffmpeg -y -i "{input_path}" -ar 16000 -ac 1 -c:a pcm_s16le "{output_path}" >/dev/null 2>&1')
+        try:
+            with wave.open(output_path, "rb") as f:
+                return f.getnframes() / float(f.getframerate())
+        except Exception:
+            return 3.0
+
+
+async def _stream_megaphone_file(input_file: str):
+    tmp_16k = f"/tmp/megaphone_16k_{int(time.time()*1000)}.wav"
+    duration = prepare_audio_for_megaphone(input_file, tmp_16k)
+    logger.info("Streaming %s (16kHz resampled, duration %.2fs) via Megaphone...", input_file, duration)
+
+    await _audio_hub.enter_megaphone()
+    await asyncio.sleep(0.5)
+
+    res = await _audio_hub.upload_megaphone(tmp_16k)
+
+    # Wait for the robot speaker to finish playing the audio in real time!
+    play_wait = max(duration + 1.2, 2.5)
+    await asyncio.sleep(play_wait)
+
+    await _audio_hub.exit_megaphone()
+    try:
+        os.remove(tmp_16k)
+    except Exception:
+        pass
+    return res
+
+
+def generate_tts_file(text: str, lang: str = "en") -> str:
+    tmp_mp3 = f"/tmp/tts_raw_{int(time.time()*1000)}.mp3"
+    tmp_wav = f"/tmp/tts_raw_{int(time.time()*1000)}.wav"
+
+    try:
+        from gtts import gTTS
+        tts = gTTS(text=text, lang=lang)
+        tts.save(tmp_mp3)
+        if os.path.isfile(tmp_mp3) and os.path.getsize(tmp_mp3) > 100:
+            return tmp_mp3
+    except Exception:
+        pass
+
+    os.system(f'espeak-ng -w "{tmp_wav}" "{text}" >/dev/null 2>&1')
+    if os.path.isfile(tmp_wav) and os.path.getsize(tmp_wav) > 100:
+        return tmp_wav
+
+    return ""
+
+
 @app.route("/audio/play/<sound_id>", methods=["POST", "GET", "OPTIONS"])
 def play_audio(sound_id):
     if request.method == "OPTIONS":
@@ -218,17 +283,9 @@ def play_audio(sound_id):
             break
 
     if target_file and os.path.isfile(target_file):
-        async def _stream_file():
-            await _audio_hub.enter_megaphone()
-            await asyncio.sleep(0.3)
-            res = await _audio_hub.upload_megaphone(target_file)
-            await asyncio.sleep(0.5)
-            await _audio_hub.exit_megaphone()
-            return res
-
         try:
-            fut = asyncio.run_coroutine_threadsafe(_stream_file(), _loop)
-            res = fut.result(timeout=30)
+            fut = asyncio.run_coroutine_threadsafe(_stream_megaphone_file(target_file), _loop)
+            res = fut.result(timeout=45)
             return jsonify({"status": "ok", "played": sound_id, "mode": "file", "file": target_file, "result": res})
         except Exception as exc:
             logger.exception("audio play file error")
@@ -236,28 +293,11 @@ def play_audio(sound_id):
 
     # 3. Fallback to dynamically generated TTS for any unknown sound name!
     text_to_say = TTS_TEXT_MAP.get(sid, f"Audio alert: {sid.replace('_', ' ')}")
-    tmp_path = f"/tmp/tts_{sid}.mp3"
-    try:
-        from gtts import gTTS
-        tts = gTTS(text=text_to_say, lang="en")
-        tts.save(tmp_path)
-    except Exception:
-        tmp_wav = f"/tmp/tts_{sid}.wav"
-        os.system(f'espeak-ng -w "{tmp_wav}" "{text_to_say}" || echo "TTS"')
-        tmp_path = tmp_wav
-
-    if os.path.isfile(tmp_path):
-        async def _stream_tts():
-            await _audio_hub.enter_megaphone()
-            await asyncio.sleep(0.3)
-            res = await _audio_hub.upload_megaphone(tmp_path)
-            await asyncio.sleep(0.5)
-            await _audio_hub.exit_megaphone()
-            return res
-
+    tts_file = generate_tts_file(text_to_say, lang="en")
+    if tts_file:
         try:
-            fut = asyncio.run_coroutine_threadsafe(_stream_tts(), _loop)
-            res = fut.result(timeout=30)
+            fut = asyncio.run_coroutine_threadsafe(_stream_megaphone_file(tts_file), _loop)
+            res = fut.result(timeout=45)
             return jsonify({"status": "ok", "played": sound_id, "mode": "tts", "text": text_to_say, "result": res})
         except Exception as exc:
             logger.exception("audio play tts error")
@@ -277,20 +317,12 @@ def play_megaphone():
         return jsonify({"error": "no file uploaded, expected multipart 'file'"}), 400
 
     file = request.files["file"]
-    tmp_path = "/tmp/uploaded_speech.wav"
+    tmp_path = f"/tmp/uploaded_speech_{int(time.time()*1000)}.wav"
     file.save(tmp_path)
 
-    async def _stream_megaphone():
-        await _audio_hub.enter_megaphone()
-        await asyncio.sleep(0.3)
-        res = await _audio_hub.upload_megaphone(tmp_path)
-        await asyncio.sleep(0.5)
-        await _audio_hub.exit_megaphone()
-        return res
-
     try:
-        fut = asyncio.run_coroutine_threadsafe(_stream_megaphone(), _loop)
-        res = fut.result(timeout=30)
+        fut = asyncio.run_coroutine_threadsafe(_stream_megaphone_file(tmp_path), _loop)
+        res = fut.result(timeout=45)
         return jsonify({"status": "ok", "result": res})
     except Exception as exc:
         logger.exception("megaphone error")
@@ -331,29 +363,14 @@ def speak_text():
         return jsonify({"error": "text required"}), 400
 
     lang = data.get("lang", "en") if isinstance(data, dict) else "en"
-    tmp_path = "/tmp/tts_speech.mp3"
-    try:
-        from gtts import gTTS
-        tts = gTTS(text=text, lang=lang)
-        tts.save(tmp_path)
-    except Exception:
-        os.system(f'espeak-ng -w /tmp/tts_speech.wav "{text}" || echo "TTS"')
-        tmp_path = "/tmp/tts_speech.wav"
-
-    async def _stream_tts():
-        if _audio_hub:
-            await _audio_hub.enter_megaphone()
-            await asyncio.sleep(0.3)
-            res = await _audio_hub.upload_megaphone(tmp_path)
-            await asyncio.sleep(0.5)
-            await _audio_hub.exit_megaphone()
-            return res
-        return "audio hub unavailable"
+    tts_file = generate_tts_file(text, lang=lang)
+    if not tts_file:
+        return jsonify({"error": "Failed to generate TTS audio"}), 500
 
     try:
         if _audio_hub and _loop:
-            fut = asyncio.run_coroutine_threadsafe(_stream_tts(), _loop)
-            res = fut.result(timeout=30)
+            fut = asyncio.run_coroutine_threadsafe(_stream_megaphone_file(tts_file), _loop)
+            res = fut.result(timeout=45)
             return jsonify({"status": "ok", "text": text, "lang": lang, "result": res})
         else:
             return jsonify({"status": "ok", "text": text, "simulated": True})
